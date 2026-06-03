@@ -1,0 +1,26 @@
+name: keep-alive middleware
+
+# Mantiene despierto el middleware de Render (free tier duerme tras ~15 min de
+# inactividad, lo que hace que el PRIMER lead del día espere 30-60s por su DM).
+# Un ping cada ~10 min evita ese cold-start. Corre en los runners de GitHub
+# (24/7, no depende de que la PC del usuario esté encendida).
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # cada 10 minutos (UTC)
+  workflow_dispatch:          # permite dispararlo a mano desde la pestaña Actions
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Despertar middleware
+        run: |
+          for url in \
+            "https://ahw-middleware.onrender.com/" \
+            "https://ahw-middleware.onrender.com/health" ; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 60 "$url" || echo "000")
+            echo "$url -> $code"
+            if [ "$code" = "200" ]; then exit 0; fi
+          done
+          echo "WARN: ningún endpoint devolvió 200 (puede estar despertando)"
