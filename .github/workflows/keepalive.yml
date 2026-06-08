@@ -1,30 +1,66 @@
 name: keep-alive middleware
 
 # Mantiene despierto el middleware de Render (free tier duerme tras ~15 min de
-# inactividad, lo que hace que el PRIMER lead del día espere 30-60s por su DM).
-# Un ping cada ~10 min evita ese cold-start. Corre en los runners de GitHub
-# (24/7, no depende de que la PC del usuario esté encendida).
+# inactividad -> el primer lead de cada ventana fria esperaba 30-60s por su DM,
+# y si el webhook de GHL expiraba por el cold-start, el lead se caia).
+#
+# POR QUE BUCLE LARGO (y no solo un cron */10):
+#   GitHub Actions NO honra crons de alta frecuencia: throttlea/coalesce los
+#   */10 a ~cada 2h (verificado en el historial 2026-06-08). Render duerme a los
+#   15 min, asi que un */10 "real cada 2h" lo deja frio casi todo el dia.
+#   Solucion: cada corrida que SI dispare GitHub se queda viva pingeando cada
+#   5 min hasta ~5h40m. Con cancel-in-progress siempre hay exactamente 1 job
+#   vivo, y el bucle largo cubre cualquier hueco entre triggers de GitHub.
+#
+# COSTO: repo publico => minutos de Actions ilimitados gratis. La guarda de
+# ventana activa (sale 06-10 UTC) deja dormir Render de madrugada -> ~570
+# hrs-instancia/mes, bajo el limite gratis de 750.
 
 on:
   schedule:
-    # Cada 10 min SOLO en horario activo de leads: 11:00–05:59 UTC = ~6am–12am
-    # Central. Evita gastar las 750 hrs/mes gratis de Render manteniéndolo
-    # despierto de madrugada cuando nadie comenta. (~570 hrs/mes, holgado.)
+    # Ventana activa de leads: 11-23 y 00-05 UTC (~6am-12am Central). Estos
+    # triggers solo (re)arrancan el bucle; la frecuencia real no importa porque
+    # cada corrida se mantiene viva sola.
     - cron: "*/10 11-23 * * *"
     - cron: "*/10 0-5 * * *"
-  workflow_dispatch:          # permite dispararlo a mano desde la pestaña Actions
+  workflow_dispatch:          # permite arrancar el bucle a mano
+
+# Un solo bucle vivo a la vez: un trigger nuevo cancela el anterior y arranca
+# fresco -> cobertura continua sin acumular corridas.
+concurrency:
+  group: keepalive-middleware
+  cancel-in-progress: true
+
+permissions: {}
 
 jobs:
   ping:
     runs-on: ubuntu-latest
+    timeout-minutes: 350        # margen bajo el limite duro de 360 min del job
     steps:
-      - name: Despertar middleware
+      - name: Mantener middleware despierto (bucle de pings)
         run: |
-          for url in \
-            "https://ahw-middleware.onrender.com/" \
-            "https://ahw-middleware.onrender.com/health" ; do
-            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 60 "$url" || echo "000")
-            echo "$url -> $code"
-            if [ "$code" = "200" ]; then exit 0; fi
+          set -u
+          URL="https://ahw-middleware.onrender.com/"
+          MAX_SECONDS=$(( 340 * 60 ))   # ~5h40m: sale antes del timeout del job
+          start=$(date +%s)
+          while : ; do
+            elapsed=$(( $(date +%s) - start ))
+            if [ "$elapsed" -ge "$MAX_SECONDS" ]; then
+              echo "Maximo del job alcanzado (${elapsed}s); el schedule reinicia el bucle."
+              break
+            fi
+            h=$(date -u +%H)
+            # Fuera de la ventana activa (06-10 UTC) dejamos dormir Render para
+            # respetar las 750 hrs/mes gratis. 10# evita que 08/09 se lean octal.
+            if [ "$((10#$h))" -ge 6 ] && [ "$((10#$h))" -le 10 ]; then
+              echo "UTC ${h}h fuera de ventana activa -> dejo dormir Render, salgo."
+              break
+            fi
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 60 "$URL" || echo "000")
+            echo "$(date -u '+%F %T') UTC  $URL -> $code"
+            if [ "$code" != "200" ]; then
+              echo "WARN: ping no devolvio 200 (puede estar despertando)."
+            fi
+            sleep 300
           done
-          echo "WARN: ningún endpoint devolvió 200 (puede estar despertando)"
